@@ -11,7 +11,7 @@ use crate::{
     profiling::{tracy_plot, tracy_zone},
     renderer::{GridRenderer, RendererSettings, animation_utils::*},
     settings::Settings,
-    units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, PixelVec, to_skia_rect},
+    units::{GridPos, GridRect, GridScale, GridSize, PixelPos, PixelRect, PixelSize, PixelVec, to_skia_rect},
     utils::RingBuffer,
 };
 
@@ -67,6 +67,7 @@ pub enum WindowDrawCommand {
         right: u64,
     },
     SortOrder(SortOrder),
+    SetGridFontScale { scale: f32 },
 }
 
 struct RenderedLine {
@@ -93,6 +94,10 @@ pub struct RenderedWindow {
 
     pub grid_size: GridSize<u32>,
 
+    /// Per-window font scale factor. 1.0 = normal size.
+    /// Used for minimap: 0.35 = ~5pt when base is ~14pt.
+    pub font_scale: f32,
+
     scrollback_lines: RingBuffer<Option<Rc<RefCell<RenderedLine>>>>,
     actual_lines: RingBuffer<Option<Rc<RefCell<RenderedLine>>>>,
     scroll_delta: isize,
@@ -113,6 +118,9 @@ pub struct WindowDrawDetails {
     pub region: PixelRect<f32>,
     pub grid_size: GridSize<u32>,
     pub window_type: WindowType,
+    /// Per-window font scale (1.0 = normal, <1 = minimap). Used by the mouse
+    /// manager to convert pixel positions inside a shrunk window correctly.
+    pub font_scale: f32,
 }
 
 impl WindowDrawDetails {
@@ -133,7 +141,6 @@ impl RenderedWindow {
             window_type: WindowType::Editor,
 
             grid_size,
-
             actual_lines: RingBuffer::new(grid_size.height as usize, None),
             scrollback_lines: RingBuffer::new(2 * grid_size.height as usize, None),
             scroll_delta: 0,
@@ -146,6 +153,7 @@ impl RenderedWindow {
 
             scroll_animation: CriticallyDampedSpringAnimation::new(),
             scroll_animation_delta: 0.0,
+            font_scale: 1.0,
         }
     }
 
@@ -154,7 +162,19 @@ impl RenderedWindow {
         // characters.
         let fract = (self.grid_destination * grid_scale).fract();
         let pos = (self.grid_current_position * grid_scale - fract).round() + fract.to_vector();
-        PixelRect::<f32>::from_origin_and_size(pos.into(), self.grid_size() * grid_scale)
+        // The window's top-left is anchored in absolute grid coordinates, so it is
+        // placed at full grid_scale. Its SIZE, however, is scaled by font_scale for
+        // minimap windows: a float window of 63 logical rows x 0.35 shrinks to
+        // ~22 screen rows, filling the editor height instead of overflowing it.
+        let size_scale = if (self.font_scale - 1.0).abs() < f32::EPSILON {
+            grid_scale
+        } else {
+            GridScale::new(PixelSize::new(
+                grid_scale.width() * self.font_scale,
+                grid_scale.height() * self.font_scale,
+            ))
+        };
+        PixelRect::<f32>::from_origin_and_size(pos.into(), self.grid_size() * size_scale)
     }
 
     fn grid_size(&self) -> GridSize<u32> {
@@ -190,16 +210,58 @@ impl RenderedWindow {
 
         match self.anchor_info {
             None => destination,
-            Some(AnchorInfo { anchor_type: WindowAnchor::Absolute, .. }) => destination,
+            Some(AnchorInfo { anchor_type: WindowAnchor::Absolute, .. }) => {
+                // Minimap windows (font_scale < 1): Neovim positions the float by
+                // its full logical width, which is larger than the shrunk rendered
+                // width. Snap the window flush with the right edge of the grid.
+                if (self.font_scale - 1.0).abs() < f32::EPSILON {
+                    destination
+                } else {
+                    let grid_size: GridSize<f32> = self.grid_size().try_cast().unwrap();
+                    let effective_size = GridSize::new(
+                        grid_size.width * self.font_scale,
+                        grid_size.height * self.font_scale,
+                    );
+                    GridPos::<f32>::new(
+                        grid_rect.max.x - effective_size.width,
+                        destination.y.min(grid_rect.max.y - effective_size.height).max(grid_rect.min.y),
+                    )
+                }
+            }
             _ => {
+                // Minimap windows (font_scale < 1) are anchored at logical grid
+                // coordinates that may extend past the screen edge; their rendered
+                // size is smaller than the logical grid_size, so clamp against the
+                // effective size to let them sit flush with the right edge.
+                let scale = if (self.font_scale - 1.0).abs() < f32::EPSILON {
+                    1.0
+                } else {
+                    self.font_scale
+                };
                 let grid_size: GridSize<f32> = self.grid_size().try_cast().unwrap();
-                // If a floating window is partially outside the grid, then move it in from the right, but
-                // ensure that the left edge is always visible.
-                let x = destination.x.min(grid_rect.max.x - grid_size.width).max(grid_rect.min.x);
+                let effective_size = GridSize::new(
+                    grid_size.width * scale,
+                    grid_size.height * scale,
+                );
+                // For minimap windows (font_scale < 1) the Neovim-side layout
+                // positions the float by its full logical width, which is larger
+                // than the shrunk rendered width. Force the window to sit flush
+                // with the right edge of the grid so the minimap hugs the screen
+                // edge instead of stopping mid-screen.
+                let x = if scale < 1.0 {
+                    grid_rect.max.x - effective_size.width
+                } else {
+                    // If a floating window is partially outside the grid, then move it in from the right, but
+                    // ensure that the left edge is always visible.
+                    destination
+                        .x
+                        .min(grid_rect.max.x - effective_size.width)
+                        .max(grid_rect.min.x)
+                };
 
                 // For messages the last line is most important, (it shows press enter), so let the position go negative
                 // Otherwise ensure that the window start row is within the screen
-                let mut y = destination.y.min(grid_rect.max.y - grid_size.height);
+                let mut y = destination.y.min(grid_rect.max.y - effective_size.height);
                 if !matches!(self.window_type, WindowType::Message { .. }) {
                     y = y.max(grid_rect.min.y)
                 }
@@ -348,6 +410,9 @@ impl RenderedWindow {
         content_region: Option<PixelRect<f32>>,
         rightmost_window: bool,
     ) -> WindowDrawDetails {
+        // Window layout: the top-left is anchored at full grid_scale, but the
+        // size is scaled by font_scale (see pixel_region), so minimap windows
+        // occupy their correct (shrunk) screen region.
         let pixel_region_box = self.pixel_region(grid_scale);
         let draw_region_box = self.expanded_pixel_region(
             pixel_region_box,
@@ -355,7 +420,6 @@ impl RenderedWindow {
             grid_scale,
             rightmost_window,
         );
-        let pixel_region = to_skia_rect(&draw_region_box);
 
         if !self.valid {
             return WindowDrawDetails {
@@ -363,16 +427,40 @@ impl RenderedWindow {
                 region: pixel_region_box,
                 grid_size: self.grid_size,
                 window_type: self.window_type,
+                font_scale: self.font_scale,
             };
         }
 
         root_canvas.save();
-        root_canvas.clip_rect(pixel_region, None, Some(false));
-        root_canvas.clear(default_background);
-
-        self.draw_background_surface(root_canvas, draw_region_box, grid_scale);
-        self.draw_foreground_surface(root_canvas, draw_region_box, grid_scale);
-
+        if (self.font_scale - 1.0).abs() < f32::EPSILON {
+            // Normal window: draw at full scale
+            let pixel_region = to_skia_rect(&draw_region_box);
+            root_canvas.clip_rect(pixel_region, None, Some(false));
+            root_canvas.clear(default_background);
+            self.draw_background_surface(root_canvas, draw_region_box, grid_scale);
+            self.draw_foreground_surface(root_canvas, draw_region_box, grid_scale);
+        } else {
+            // Minimap window: scale the canvas so the full-size glyphs are drawn
+            // smaller. Window layout (draw_region_box) stays at full scale; only
+            // the drawing coordinates are divided by font_scale since the canvas
+            // transform multiplies them.
+            //
+            // IMPORTANT: the line-spacing grid_scale passed to the draw helpers
+            // must be the ORIGINAL grid_scale, NOT the effective one. The canvas
+            // scale(f) transform multiplies the translate matrices too, so
+            // passing the original H yields f*H = effective line spacing on
+            // screen. Passing effective H here would compress spacing by another
+            // f and stack lines on top of each other.
+            let f = self.font_scale;
+            root_canvas.scale((f, f));
+            let inv = 1.0 / f;
+            let scaled_region =
+                PixelRect::new(draw_region_box.min * inv, draw_region_box.max * inv);
+            root_canvas.clip_rect(to_skia_rect(&scaled_region), None, Some(false));
+            root_canvas.clear(default_background);
+            self.draw_background_surface(root_canvas, scaled_region, grid_scale);
+            self.draw_foreground_surface(root_canvas, scaled_region, grid_scale);
+        }
         root_canvas.restore();
 
         WindowDrawDetails {
@@ -380,6 +468,7 @@ impl RenderedWindow {
             region: draw_region_box,
             grid_size: self.grid_size,
             window_type: self.window_type,
+            font_scale: self.font_scale,
         }
     }
 
@@ -739,8 +828,11 @@ impl RenderedWindow {
                     anchor_info.sort_order = sort_order;
                 }
             }
+            WindowDrawCommand::SetGridFontScale { scale } => {
+                self.font_scale = scale.clamp(0.1, 1.0);
+            }
             _ => {}
-        };
+        }
     }
 
     pub fn flush(&mut self, renderer_settings: &RendererSettings) {
